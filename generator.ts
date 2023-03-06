@@ -30,7 +30,7 @@ Variable data:
 Overview of process as understood by me:
 - Begin by arranging data into a unified array of DimensionPoint objects
 - Perform basic checks of material dimensions vs points
-- Divide into sections based on pull length (first section becomes the short one)
+- Divide into sections based on pull length (should be able to leave last one as short one)
 - Generate beginning code:
     - Basic overall settings
 - Generate cycle codes:
@@ -38,7 +38,7 @@ Overview of process as understood by me:
     - Pause program
     - Back off to safe location
     - Start spindle
-    - Roughing and finishing passes (pass stickout amount into these to profile correctly)
+    - Roughing and finishing passes
     - Move to safe location
     - Stop spindle
 - Cleanup:
@@ -46,15 +46,32 @@ Overview of process as understood by me:
     - ?
 */
 
+/*
+Until further input, I will be treating the set home position as:
+    X = 0 is the axis of rotation
+    Z = 0 is the face of the workpiece when pulled out to the length denoted by "stickout"
+*/
+
 class MovePoint {
     x: number | undefined
     y: number | undefined
     z: number | undefined
+    axesPresent: {
+        x: boolean,
+        y: boolean,
+        z: boolean
+    }
     
     constructor (x?: number, y?: number, z?: number) {
+        if (arguments.length === 0) {
+            throw new SyntaxError("Cannot create MovePoint with no elements")
+        }
         this.x = x
         this.y = y
         this.z = z
+        this.axesPresent.x = x === undefined
+        this.axesPresent.y = y === undefined
+        this.axesPresent.z = z === undefined
     }
 }
 
@@ -66,65 +83,94 @@ class DimensionPoint {
         this.x = x
         this.z = z
     }
+
+    getMovePoint(): MovePoint {
+        return new MovePoint(this.x, undefined, this.z)
+    }
 }
 
 class Section {
+    // Points in traditional format, with first point at z = 0 and last at z = length
     points: DimensionPoint[]
+    // Modified version of points array, offset by stickout and sorted by descending z to allow ease of access for machining operations
+    machiningPoints: DimensionPoint[]
+
+    // General data about the points in the section
     length: number
+    maxDiameter: number
 
     constructor (points: DimensionPoint[]) {
         this.points = points
+        this.machiningPoints = points.slice().sort((a, b) => b.z - a.z)
+        this.machiningPoints.forEach(point => {
+            point.z -= global.stickout
+        })
         this.length = Math.max(...(points.map( (point) => point.z)))
+        this.maxDiameter = Math.max(...(points.map( (point) => point.x)))
     }
 
-    getOffsetPoint(index: number): DimensionPoint {
+    // Provides point in format offset in Z axis such that z values' range is [-length, 0]
+    getLengthOffsetPoint(index: number): DimensionPoint {
         return new DimensionPoint(this.points[index].x, this.points[index].z - this.length)
     }
 }
 
 
 // CONSTANTS
-// Cut depths
-const maxRoughingDepth: number = 0.040
-const minFinishDepth: number = 0.010
+const global = {
+    depths: {
+        max: 0.040,
+        min: 0.010
+    },
+    spacing: {
+        xClearance: 0.010,
+        zClearance: 0.100,
+    },
+    feed: 0.002,
+    stickout: 1.000,
+    decimals: 4
+}
 
-// Spacing for safety
-const xSafeOffset: number = 0.01
-const zSafeOffset: number = 0.1
-const zCutPullback: number = 0.01
+var state = {
+    lastGCode: "None",
+    lastFeed: -1,
+    position: {
+        x: 0,
+        y: 0,
+        z: 0
+    }
+}
 
-// Feed rates
-const fineFeed: number = 0.002
-
-// Part stickout
-const stickout: number = 1.0
-
-// Code accuracy
-const decimals: number = 4
-
-// GLOBALS
-var lastGCode: string = "None"
-var lastFeed: number | undefined = -1
-
-function rapidPosition(x?: number, y?: number, z?: number, comment?: string): string {
+function rapidPosition(point: MovePoint, comment?: string): string {
+    // Check that of present axes, at least one is separate from the current position
+    if (
+        (!point.axesPresent.x || point.x === state.position.x) &&
+        (!point.axesPresent.y || point.y === state.position.y) &&
+        (!point.axesPresent.z || point.z === state.position.z)
+    ) {
+        return ""
+    }
+    
     let code: string = ""
 
     // Check if the last code used was this one
     // If so, we don't need to print the code
-    if (lastGCode != "00") {
+    if (state.lastGCode != "00") {
         code += "G00"
     }
 
-    // Check each variable to see if it's given
-    if (typeof x !== 'undefined') {
-        code += "X" + (+x.toFixed(decimals))
+    // Insert axis data where present and new
+    if (point.axesPresent.x && point.x !== state.position.x) {
+        code += "X" + (+point.x!.toFixed(global.decimals))
     }
-    if (typeof y !== 'undefined') {
-        code += "Y" + (+y.toFixed(decimals))
+    if (point.axesPresent.y && point.y !== state.position.y) {
+        code += "Y" + (+point.y!.toFixed(global.decimals))
     }
-    if (typeof z !== 'undefined') {
-        code += "Z" + (+z.toFixed(decimals))
+    if (point.axesPresent.z && point.z !== state.position.z) {
+        code += "Z" + (+point.z!.toFixed(global.decimals))
     }
+    
+    // Insert comment if present
     if (typeof comment !== 'undefined') {
         code += "(" + comment + ")"
     }
@@ -133,34 +179,47 @@ function rapidPosition(x?: number, y?: number, z?: number, comment?: string): st
     code += "\n"
 
     // Set last G code used and reset feed rate
-    lastGCode = "00"
-    lastFeed = -1
+    state.lastGCode = "00"
+    state.lastFeed = -1
 
     return code
 }
 
-function linearInterpolation(x?: number, y?: number, z?: number, feed?: number, comment?: string): string {
+function linearInterpolation(point: MovePoint, feed?: number, comment?: string): string {
+    // Check that of present axes, at least one is separate from the current position
+    if (
+        (!point.axesPresent.x || point.x === state.position.x) &&
+        (!point.axesPresent.y || point.y === state.position.y) &&
+        (!point.axesPresent.z || point.z === state.position.z)
+    ) {
+        return ""
+    }
+
     let code = ""
 
     // Check if the last code used was this one
     // If so, we don't need to print the code
-    if (lastGCode != "01") {
+    if (state.lastGCode != "01") {
         code += "G01"
     }
 
-    // Check each variable to see if it's given
-    if (typeof x !== 'undefined') {
-        code += "X" + (+x.toFixed(decimals))
+    // Insert axis data where present and new
+    if (point.axesPresent.x && point.x !== state.position.x) {
+        code += "X" + (+point.x!.toFixed(global.decimals))
     }
-    if (typeof y !== 'undefined') {
-        code += "Y" + (+y.toFixed(decimals))
+    if (point.axesPresent.y && point.y !== state.position.y) {
+        code += "Y" + (+point.y!.toFixed(global.decimals))
     }
-    if (typeof z !== 'undefined') {
-        code += "Z" + (+z.toFixed(decimals))
+    if (point.axesPresent.z && point.z !== state.position.z) {
+        code += "Z" + (+point.z!.toFixed(global.decimals))
     }
-    if (typeof feed !== 'undefined' && feed != lastFeed) {
-        code += "F" + (+feed.toFixed(decimals))
+
+    // Insert feed rate if present and changed
+    if (typeof feed !== 'undefined' && feed != state.lastFeed) {
+        code += "F" + (+feed.toFixed(global.decimals))
     }
+
+    // Insert comment if present
     if (typeof comment !== 'undefined') {
         code += "(" + comment + ")"
     }
@@ -169,23 +228,23 @@ function linearInterpolation(x?: number, y?: number, z?: number, feed?: number, 
     code += "\n"
 
     // Set last G code used and feed rate
-    lastGCode = "01"
-    lastFeed = feed
+    state.lastGCode = "01"
+    state.lastFeed = (feed === undefined ? -1 : feed)
 
     return code
 }
 
-function boxCycle(startX: number, startZ: number, endX: number, endZ: number, finishBufferRadius: number, feed: number, comment?: string): string {
+function boxCycle(startPoint: DimensionPoint, endPoint: DimensionPoint, finishBufferRadius: number, feed: number, comment?: string): string {
     // Set initial position with rapid positioning
-    let code: string = rapidPosition(startX, undefined, startZ)
+    let code: string = rapidPosition(startPoint.getMovePoint())
 
     // Set up 
     code += "G74"
-    code += "X" + (+endX.toFixed(decimals))
-    code += "X" + (+endZ.toFixed(decimals))
-    code += "I" + (+(maxRoughingDepth / 2).toFixed(decimals))
-    code += "U" + (+finishBufferRadius.toFixed(decimals))
-    code += "F" + (+feed.toFixed(decimals))
+    code += "X" + (+endPoint.x.toFixed(global.decimals))
+    code += "X" + (+endPoint.z.toFixed(global.decimals))
+    code += "I" + (+(global.depths.max / 2).toFixed(global.decimals))
+    code += "U" + (+finishBufferRadius.toFixed(global.decimals))
+    code += "F" + (+feed.toFixed(global.decimals))
 
     if (typeof comment !== 'undefined') {
         code += "(" + comment + ")"
@@ -195,21 +254,31 @@ function boxCycle(startX: number, startZ: number, endX: number, endZ: number, fi
     code += "\n"
 
     // Reset last used function for safety
-    lastGCode = "None"
+    state.lastGCode = "None"
 
     return code
 }
 
-function contourCycle(startX: number, startZ: number, points: number[][], subroutineID: number, finishBufferRadius: number, feed: number, comment?: string): string {
-    // Set initial position with rapid positioning
-    let code: string = linearInterpolation(startX, undefined, startZ, feed)
+// TODO: Decide if this should be built around sections or points
+/**
+ * Generates a G75 contour cycle for a specified section.
+ * The cutter is returned to the start point by the G75 cycle.
+ *
+ * @param startPoint The initial position of the cutter, defining the oustide axes of material to be removed.
+ * @param section The section whose points are to be roughed out.  Those points define the inside contour of material removal.
+ * @param subroutineID Not currently in use due to subroutine functionality being unclear.  The number to use as a label for the subroutine.
+ * @return Code setting the initial position and running the G75 process.
+ */
+function contourCycle(startPoint: DimensionPoint, section: Section, subroutineID: number, finishBufferRadius: number, feed: number, comment?: string): string {
+    // Set initial position
+    let code: string = linearInterpolation(startPoint.getMovePoint(), feed)
 
     // Set up 
     code += "G75"
-    code += "I" + (+(maxRoughingDepth / 2).toFixed(decimals))
-    code += "U" + (+finishBufferRadius.toFixed(decimals))
-    code += "F" + (+feed.toFixed(decimals))
-    code += "P" + (+subroutineID.toFixed(decimals))
+    code += "I" + (+(global.depths.max / 2).toFixed(global.decimals))
+    code += "U" + (+finishBufferRadius.toFixed(global.decimals))
+    code += "F" + (+feed.toFixed(global.decimals))
+    code += "P" + (+subroutineID.toFixed(global.decimals))
 
     if (typeof comment !== 'undefined') {
         code += "(" + comment + ")"
@@ -219,20 +288,21 @@ function contourCycle(startX: number, startZ: number, points: number[][], subrou
     code += "\n"
 
     // Reset last used function for safety
-    lastGCode = "None"
+    state.lastGCode = "None"
 
-    code += taperSubroutine(subroutineID, points)
+    code += taperSubroutine(subroutineID, section)
 
     return code
 }
 
-function taperSubroutine(id: number, points: number[][]): string {
+// TODO: sections vs points continues to here
+function taperSubroutine(id: number, section: Section): string {
     // Removing subroutine formatting (added in G3?), using RF to close
     // let code = "}" + id + "\n"
     let code: string = ""
 
-    points.forEach(point => {
-        code += "X" + (+point[0].toFixed(decimals)) + "Z" + (+point[1].toFixed(decimals)) + "\n"
+    section.machiningPoints.forEach(point => {
+        code += "X" + (+point.x.toFixed(global.decimals)) + "Z" + (+point.z.toFixed(global.decimals)) + "\n"
     })
 
     code += "RF"
@@ -241,66 +311,90 @@ function taperSubroutine(id: number, points: number[][]): string {
     return code
 }
 
-function taperCycle(safeDiameter: number, points: number[][], feed: number): string {
-    // Set up easy access to the first point
-    let startX: number = points[0][0]
-    let startZ: number = points[0][1]
-    // Jog to starting position from previous spot
-    let code: string = linearInterpolation(safeDiameter + xSafeOffset, undefined, undefined)
-    code += rapidPosition(undefined, undefined, startZ + zSafeOffset)
-    code += rapidPosition(startX + xSafeOffset)
-    // Set up starting point
-    code += linearInterpolation(startX, undefined, undefined, feed)
-    code += linearInterpolation(undefined, undefined, startZ, feed)
-    // Run path
+/**
+ * Generates a basic set of linear movements between the specified points.
+ * Cutter position at call time is assumed to be a safe location for movement to start point.
+ * The cutter is returned to the z position of the start value, and an x clearanced above the maximum level of the taper
+ *
+ * @param points The set of points the cutter will travel along.
+ * @param feed The feed rate to be used in the linear interpolations.
+ * @return Code directing the cutter to follow the specified taper and return to a safe location.
+ */
+function basicTaper(points: MovePoint[], feed: number): string {
+    let code: string = ""
+    let startZ = state.position.z
+
+    // Run path, beginning with movement to start point
     points.forEach(point => {
-        code += linearInterpolation(point[0], undefined, point[1], feed)
+        code += linearInterpolation(point, feed)
     })
+
+    // Return to clearanced version of start location
+    code += linearInterpolation(new MovePoint(Math.max(...points.map(point => point.x!)) + global.spacing.xClearance))
+    code += rapidPosition(new MovePoint(undefined, undefined, startZ))
     return code
 }
 
-function sectionCycle(startDiameter: number, points: number[][], subroutineID: number, pullLength?: number): string {
+function sectionCycle(startDiameter: number, section: Section, subroutineID: number): string {
     // Confirm that points in section will be accurately cut into material
-    let diameters: number[] = points.map(function(point) { return point[0] })
-    let maxDiameter: number = Math.max(...diameters)
-    if (maxDiameter > startDiameter) {
+    if (section.maxDiameter > startDiameter) {
         throw new RangeError("Provided taper includes diameter(s) exceeding provided start diameter, taper will not be accurate!")
     }
 
-    // Set pullLength to stickout if undefined
-    if (typeof pullLength === 'undefined') {
-        pullLength = stickout
-    }
-    // Redefine 0 point of z axis 
+    /*
+    - Set zeroing location
+    - Pause program for stock pull/insertion
+    - Back off to safe location
+    - Start spindle
+    - Roughing and finishing passes
+    - Move to safe location
+    - Stop spindle
+    */
 
     let code = ""
-    // Set safe starting point
-    code += rapidPosition(startDiameter + xSafeOffset, undefined, zSafeOffset)
+    // Set pull location for current section.  This will be the point in the section with the highest z value.
+    code += linearInterpolation(new MovePoint(section.machiningPoints[0].x + global.spacing.xClearance, undefined, section.machiningPoints[0].z))
+    
+    // Pause program for stock pull/insertion
+    code += "M01(Move stock to appropriate position)"
+    
+    // Move to safe starting point
+    code += linearInterpolation(new MovePoint(startDiameter + global.spacing.xClearance, undefined, section.length - global.stickout + global.spacing.zClearance))
+
     // Begin running spindle and set feed rate
     code += "M03S1500\n"
-    // code += "G95F0.002\n"
+
     // Run G75 roughing cycle
-    code += contourCycle(startDiameter + xSafeOffset, zSafeOffset, points, subroutineID, maxRoughingDepth / 4, fineFeed)
+    code += contourCycle(
+        new DimensionPoint(startDiameter + global.spacing.xClearance, section.length - global.stickout + global.spacing.zClearance),
+        section,
+        subroutineID,
+        global.depths.max / 4,
+        global.feed)
+
     // Run finishing pass
-    code += taperCycle(maxDiameter, points, fineFeed)
-    // Return cutter to safe position
-    code += linearInterpolation(startDiameter + xSafeOffset, undefined, undefined, fineFeed)
-    code += rapidPosition(undefined, undefined, zSafeOffset)
+    code += basicTaper(section.machiningPoints.map(point => point.getMovePoint()), global.feed)
+
+    // Return cutter to safe position for stock movement (already moved away from contact with part)
+    code += rapidPosition(new MovePoint(startDiameter + global.spacing.xClearance, undefined, global.spacing.zClearance))
+    
     // Stop spindle
     code += "M05\n"
-    // Set cutter to zeroing position (between largest taper diameter and stock diameter, we'll say largest taper diameter + safe clearance)
-    code += linearInterpolation(maxDiameter + xSafeOffset, undefined, stickout - pullLength, fineFeed)
-    // Optional stop
-    code += "M01\n"
 
     return code
 }
 
-// Returns a 3d array, with each top-level element being a set of 2D points for a specific machining section
-function interpolatePoints(xPoints: number[], zPoints: number[]): number[][][] {
+/**
+ * Generates a set of sections defined by the stickout length, using provided points and interpolating as necessary
+ *
+ * @param xPoints Array of points representing the x axis values (diameters).
+ * @param zPoints Array of points representing the y axis values (positions).
+ * @return An array of Sections representing the provided points.
+ */
+function interpolatePoints(xPoints: number[], zPoints: number[]): Section[] {
     // Determine how many sections we need to create, with the final section being the one to potentially be shorter than sectionLength
     let fullLength: number = Math.max(...zPoints)
-    var numSections: number = Math.ceil(fullLength / stickout)
+    var numSections: number = Math.ceil(fullLength / global.stickout)
 
     var startPoint: number[] = [xPoints[0], zPoints[0]]
     var startIndex: number = 0
@@ -308,15 +402,15 @@ function interpolatePoints(xPoints: number[], zPoints: number[]): number[][][] {
     var endIndex: number = 0
     
     // This variable collects the separate xPoints and zPoints arrays into a single array of individual x-z points
-    var organizedPoints: number[][] = []
+    var organizedPoints: DimensionPoint[] = []
     for (let i = 0; i < xPoints.length; i++) {
-        organizedPoints.push([xPoints[i], zPoints[i]]);
+        organizedPoints.push(new DimensionPoint(xPoints[i], zPoints[i]));
     }
 
     // This will collect the lists of points broken into sections
-    var returnArray: number[][][] = [];
+    var sections: Section[] = [];
     // Storage for points in each section
-    var includedPoints: number[][] = [];
+    var includedPoints: DimensionPoint[] = [];
 
     // We need to iterate through each section and collect the data points included in it (potentially interpolating start/end points)
     // Base cases are the first and last elements:
@@ -330,14 +424,14 @@ function interpolatePoints(xPoints: number[], zPoints: number[]): number[][][] {
     for (let i: number = 0; i < numSections - 1; i++) {
 
         // If a given section doesn't end at a specific point, we need to interpolate between the two points surrounding the division
-        if (zPoints.indexOf((i + 1) * stickout) === -1) {
+        if (zPoints.indexOf((i + 1) * global.stickout) === -1) {
             // Find the first z element that doesn't fall within the section we're looking at
-            let firstIndexInNext = zPoints.findIndex((element) => element > ((i+1) * stickout))
+            let firstIndexInNext = zPoints.findIndex((element) => element > ((i+1) * global.stickout))
             
             // Length of section is zPoints[fIIN] - zPoints[fIIN - 1]
             // Position of division in section is ((i+1) * stickout) - zPoints[fIIN - 1]
             // Decimal portion of index is second divided by first
-            endIndex = firstIndexInNext - 1 + (((i+1) * stickout) - zPoints[firstIndexInNext - 1]) / (zPoints[firstIndexInNext] - zPoints[firstIndexInNext - 1])
+            endIndex = firstIndexInNext - 1 + (((i+1) * global.stickout) - zPoints[firstIndexInNext - 1]) / (zPoints[firstIndexInNext] - zPoints[firstIndexInNext - 1])
             
             // Use this decimal portion to derive x-z end point
             endPoint[0] = xPoints[firstIndexInNext - 1] + (endIndex % 1) * (xPoints[firstIndexInNext] - xPoints[firstIndexInNext - 1])
@@ -345,37 +439,38 @@ function interpolatePoints(xPoints: number[], zPoints: number[]): number[][][] {
         }
         // Otherwise, we can use this index to set the end point
         else {
-            endIndex = zPoints.indexOf((i + 1) * stickout)
+            endIndex = zPoints.indexOf((i + 1) * global.stickout)
             endPoint[0] = xPoints[endIndex]
             endPoint[1] = zPoints[endIndex]
         }
 
         // If start index is a decimal, we need to manually include the startPoint
         if (startIndex % 1) {
-            includedPoints.push([startPoint[0], startPoint[1]])
+            includedPoints.push(new DimensionPoint(startPoint[0], startPoint[1]))
         }
-        organizedPoints.slice(Math.ceil(startIndex), Math.floor(endIndex) + 1).forEach((point) => includedPoints.push([point[0], point[1]]))
+        organizedPoints.slice(Math.ceil(startIndex), Math.floor(endIndex) + 1).forEach((point) => includedPoints.push(point))
         // Similarly, decimal end index means we need to include endPoint
         if (endIndex % 1) {
-            includedPoints.push([endPoint[0], endPoint[1]])
+            includedPoints.push(new DimensionPoint(endPoint[0], endPoint[1]))
         }
         
-        // Push this collection to our return array, shift end index/point to start, clear includedPoints
-        returnArray.push(includedPoints)
+        // Push a new section containing these points to our section array, shift end index/point to start, clear includedPoints
+        sections.push(new Section(includedPoints))
         startIndex = endIndex
         startPoint[0] = endPoint[0]
         startPoint[1] = endPoint[1]
         includedPoints = []
     }
-		endIndex = organizedPoints.length - 1
+		
+    endIndex = organizedPoints.length - 1
     // Final iteration, this will run from the start point to the final element in the provided points
     if (startIndex % 1) {
-        includedPoints.push([startPoint[0], startPoint[1]])
+        includedPoints.push(new DimensionPoint(startPoint[0], startPoint[1]))
     }
-    organizedPoints.slice(Math.ceil(startIndex), Math.floor(endIndex) + 1).forEach((point) => includedPoints.push([point[0], point[1]]))
-    returnArray.push(includedPoints)
+    organizedPoints.slice(Math.ceil(startIndex), Math.floor(endIndex) + 1).forEach((point) => includedPoints.push(point))
+    sections.push(new Section(includedPoints))
 
-    return returnArray
+    return sections
 }
 
 /**
@@ -443,13 +538,8 @@ function genCode(stockDiameter, diameterPoints, optPointLocations): string {
             optPointLocations[i] = tempObjects[i].z
         }
     }
-    // Now we need to break these points up into sections defined by our part stickout, linearly interpolating between points when divisions don't fall accurately on them.
-    var sections: number[][][] = interpolatePoints(diameterPoints, optPointLocations)
-    // Each section needs to use a coordinate system where the first point is at z=0, stickout will be z of last element
-    sections.forEach((section) => {
-        let offset: number = section[0][1]
-        section.forEach((point) => point[1] = point[1] - offset)
-    })
+    // Dividing points into sections
+    var sections: Section[] = interpolatePoints(diameterPoints, optPointLocations)
 
     // Code generation
     
@@ -472,7 +562,7 @@ function genCode(stockDiameter, diameterPoints, optPointLocations): string {
     // Description and comments
     codeText += "(OMalley Brass)\n"
     // Description?
-    codeText += `(${stickout} inch part stickout)\n`
+    codeText += `(${global.stickout} inch part stickout)\n`
     codeText += `(${stockDiameter} inch diameter stock)\n`
     codeText += "(T1 OD Cutter)\n"
     codeText += "(Code generation by Jeremy Peplinski)\n"
@@ -481,20 +571,14 @@ function genCode(stockDiameter, diameterPoints, optPointLocations): string {
 
     
     // Setup
-    codeText += `G72G90G97G95F${fineFeed}\n`
+    codeText += `G72G90G97G95F${global.feed}\n`
     codeText += "T1\n"
 
-    // Then generate code for each section, subroutine ID will be (index + 1) * 100, pull needs to be max Z of next section (except last, which we'll set at stickout)
+    // Then generate code for each section, subroutine ID will be (index + 1) * 100
     try {
         for(let i = 0; i < sections.length; i++) {
             codeText += "(Section " + (i + 1) + ")\n"
-            if (i != sections.length - 1) {
-                // pull length defined by next section
-                codeText += sectionCycle(stockDiameter, sections[i], (i + 1) * 100, sections[i + 1][sections[i+1].length - 1][1])
-            }
-            else {
-                codeText += sectionCycle(stockDiameter, sections[i], (i + 1) * 100, stickout)
-            }
+            codeText += sectionCycle(stockDiameter, sections[i], (i + 1) * 100)
         }
     } catch (err) {
         return err.message
