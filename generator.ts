@@ -69,9 +69,7 @@ class MovePoint {
         this.x = x
         this.y = y
         this.z = z
-        this.axesPresent.x = x === undefined
-        this.axesPresent.y = y === undefined
-        this.axesPresent.z = z === undefined
+        this.axesPresent = {x: x !== undefined, y: y !== undefined, z: z !== undefined}
     }
 }
 
@@ -100,13 +98,23 @@ class Section {
     maxDiameter: number
 
     constructor (points: DimensionPoint[]) {
+        // Set basic points array
         this.points = points
-        this.machiningPoints = points.slice().sort((a, b) => b.z - a.z)
+
+        // General data
+        this.length = Math.max(...(points.map( (point) => point.z)))
+        this.maxDiameter = Math.max(...(points.map( (point) => point.x)))
+
+        // Create a deep copy of each point for machiningPoints
+        // Z values are negated and offset to match original range to maintain intended cut order
+        this.machiningPoints = []
+        this.points.forEach(point => {
+            this.machiningPoints.push(new DimensionPoint(point.x, -point.z + this.length))
+        })
+        this.machiningPoints.sort((a, b) => b.z - a.z)
         this.machiningPoints.forEach(point => {
             point.z -= global.stickout
         })
-        this.length = Math.max(...(points.map( (point) => point.z)))
-        this.maxDiameter = Math.max(...(points.map( (point) => point.x)))
     }
 
     // Provides point in format offset in Z axis such that z values' range is [-length, 0]
@@ -127,17 +135,26 @@ const global = {
         zClearance: 0.100,
     },
     feed: 0.002,
+    rpm: 1500,
     stickout: 1.000,
     decimals: 4
 }
 
-var state = {
+var state: {
+    lastGCode: string,
+    lastFeed: number,
+    position: {
+        x: number | undefined,
+        y: number | undefined,
+        z: number | undefined
+    }
+} = {
     lastGCode: "None",
     lastFeed: -1,
     position: {
-        x: 0,
-        y: 0,
-        z: 0
+        x: undefined,
+        y: undefined,
+        z: undefined
     }
 }
 
@@ -278,7 +295,8 @@ function contourCycle(startPoint: DimensionPoint, section: Section, subroutineID
     code += "I" + (+(global.depths.max / 2).toFixed(global.decimals))
     code += "U" + (+finishBufferRadius.toFixed(global.decimals))
     code += "F" + (+feed.toFixed(global.decimals))
-    code += "P" + (+subroutineID.toFixed(global.decimals))
+    // Subroutines currently disabled
+    // code += "P" + (+subroutineID.toFixed(global.decimals))
 
     if (typeof comment !== 'undefined') {
         code += "(" + comment + ")"
@@ -305,7 +323,7 @@ function taperSubroutine(id: number, section: Section): string {
         code += "X" + (+point.x.toFixed(global.decimals)) + "Z" + (+point.z.toFixed(global.decimals)) + "\n"
     })
 
-    code += "RF"
+    code += "RF\n"
     // code += "M99\n"
     
     return code
@@ -353,16 +371,19 @@ function sectionCycle(startDiameter: number, section: Section, subroutineID: num
 
     let code = ""
     // Set pull location for current section.  This will be the point in the section with the highest z value.
+    // To do this with the spindle stopped, this needs to be in IPM instead of IPR
+    code += `G94F${global.rpm * global.feed}\n`
     code += linearInterpolation(new MovePoint(section.machiningPoints[0].x + global.spacing.xClearance, undefined, section.machiningPoints[0].z))
     
     // Pause program for stock pull/insertion
-    code += "M01(Move stock to appropriate position)"
+    code += "M01(Move stock to appropriate position)\n"
     
     // Move to safe starting point
     code += linearInterpolation(new MovePoint(startDiameter + global.spacing.xClearance, undefined, section.length - global.stickout + global.spacing.zClearance))
 
-    // Begin running spindle and set feed rate
-    code += "M03S1500\n"
+    // Begin running spindle and set feed rate/type
+    code += `M03S${global.rpm}\n`
+    code += `G95F${global.feed}\n`
 
     // Run G75 roughing cycle
     code += contourCycle(
@@ -389,7 +410,7 @@ function sectionCycle(startDiameter: number, section: Section, subroutineID: num
  *
  * @param xPoints Array of points representing the x axis values (diameters).
  * @param zPoints Array of points representing the y axis values (positions).
- * @return An array of Sections representing the provided points.
+ * @return An array of Sections representing the provided points.  Coordinate system within each section has first point at z=0, increasing from there
  */
 function interpolatePoints(xPoints: number[], zPoints: number[]): Section[] {
     // Determine how many sections we need to create, with the final section being the one to potentially be shorter than sectionLength
@@ -446,12 +467,16 @@ function interpolatePoints(xPoints: number[], zPoints: number[]): Section[] {
 
         // If start index is a decimal, we need to manually include the startPoint
         if (startIndex % 1) {
-            includedPoints.push(new DimensionPoint(startPoint[0], startPoint[1]))
+            includedPoints.push(new DimensionPoint(startPoint[0], startPoint[1] - (i * global.stickout)))
         }
-        organizedPoints.slice(Math.ceil(startIndex), Math.floor(endIndex) + 1).forEach((point) => includedPoints.push(point))
+        organizedPoints
+        .slice(Math.ceil(startIndex), Math.floor(endIndex) + 1)
+        .forEach((point) => {
+            includedPoints.push(new DimensionPoint(point.x, point.z - (i * global.stickout)))
+        })
         // Similarly, decimal end index means we need to include endPoint
         if (endIndex % 1) {
-            includedPoints.push(new DimensionPoint(endPoint[0], endPoint[1]))
+            includedPoints.push(new DimensionPoint(endPoint[0], endPoint[1] - (i * global.stickout)))
         }
         
         // Push a new section containing these points to our section array, shift end index/point to start, clear includedPoints
@@ -465,9 +490,13 @@ function interpolatePoints(xPoints: number[], zPoints: number[]): Section[] {
     endIndex = organizedPoints.length - 1
     // Final iteration, this will run from the start point to the final element in the provided points
     if (startIndex % 1) {
-        includedPoints.push(new DimensionPoint(startPoint[0], startPoint[1]))
+        includedPoints.push(new DimensionPoint(startPoint[0], startPoint[1] - ((numSections - 1) * global.stickout)))
     }
-    organizedPoints.slice(Math.ceil(startIndex), Math.floor(endIndex) + 1).forEach((point) => includedPoints.push(point))
+    organizedPoints
+        .slice(Math.ceil(startIndex), Math.floor(endIndex) + 1)
+        .forEach((point) => {
+            includedPoints.push(new DimensionPoint(point.x, point.z - ((numSections - 1) * global.stickout)))
+        })
     sections.push(new Section(includedPoints))
 
     return sections
@@ -482,8 +511,10 @@ function interpolatePoints(xPoints: number[], zPoints: number[]): Section[] {
  * @return G code to produce the specified mandrel, or an error if provided data cannot be used to machine an mandrel.
  * @customfunction
  */
-function genCode(stockDiameter, diameterPoints, optPointLocations): string {
-    // General setup and error checking
+function genCode(stockDiameter, diameterList, optLocationList): string {
+    // Storage for processed point data
+    var diameterPoints: number[]
+    var locationPoints: number[]
 
     // Local storage of debugging info - items ignored
     var numDiametersRemoved: number = 0
@@ -494,52 +525,63 @@ function genCode(stockDiameter, diameterPoints, optPointLocations): string {
     
     // Diameter points
     // Reorganize into 1D array
-    diameterPoints = [].concat(...diameterPoints)
+    diameterList = [].concat(...diameterList)
     // Filter out empty or non-numeric cells.  Number testing from here: https://stackoverflow.com/questions/175739/how-can-i-check-if-a-string-is-a-valid-number
-    let filteredDiameterPoints = diameterPoints.filter((element) => element !== "" && !isNaN(element) && !isNaN(parseFloat(element)))
-    numDiametersRemoved = diameterPoints.length - filteredDiameterPoints.length
-    diameterPoints = filteredDiameterPoints
+    let filteredDiameterList: number[] = diameterList.filter((element) => element !== "" && !isNaN(element) && !isNaN(parseFloat(element)))
+    numDiametersRemoved = diameterList.length - filteredDiameterList.length
+    var diameterPoints: number[] = filteredDiameterList
     diameterPoints.forEach((diameter) => diameter = +diameter)
 
     // Overloaded function that can run with or without optPointLocations, assuming a spacing of 0.250" if not provided
-    if (optPointLocations === undefined) {
-        optPointLocations = []
+    if (optLocationList === undefined) {
+        locationPoints = []
         for (let i = 0; i < diameterPoints.length; i++) {
-            optPointLocations.push(i * 0.25)
+            locationPoints.push(i * 0.25)
         }
     }
     // Otherwise, confirm that two arrays are of matching lengths and throw an error if not
-    // Then, sort by Z and offset so start point is at z=0
+    // Then, sort by Z
     else {
         // Reorganize into 1D array
-        optPointLocations = [].concat(...optPointLocations)
+        optLocationList = [].concat(...optLocationList)
         // Filter out empty or non-numeric cells.  Number testing from here: https://stackoverflow.com/questions/175739/how-can-i-check-if-a-string-is-a-valid-number
-        let filteredPointLocations = optPointLocations.filter((element) => element !== "" && !isNaN(element) && !isNaN(parseFloat(element)))
-        numPointsRemoved = optPointLocations.length - filteredPointLocations.length
-        optPointLocations = filteredPointLocations
+        let filteredLocationList = optLocationList.filter((element) => element !== "" && !isNaN(element) && !isNaN(parseFloat(element)))
+        numPointsRemoved = optLocationList.length - filteredLocationList.length
+        locationPoints = filteredLocationList
         // Ensure that values are formatted as numbers
-        optPointLocations.forEach((location) => location = +location)
+        locationPoints.forEach((location) => location = +location)
 
         // Ensure that equal numbers of points are provided
-        if (optPointLocations.length != diameterPoints.length) {
+        if (locationPoints.length != diameterPoints.length) {
             return "Diameters and locations contain unqual numbers of valid data points."
         }
 
         // Sort by z value (algorithm from: https://stackoverflow.com/questions/11499268/sort-two-arrays-the-same-way)
         var tempObjects: DimensionPoint[] = []
-        for (let i = 0; i < optPointLocations.length; i++) {
-            tempObjects.push(new DimensionPoint(diameterPoints[i], optPointLocations[i]))
+        for (let i = 0; i < locationPoints.length; i++) {
+            tempObjects.push(new DimensionPoint(diameterPoints[i], locationPoints[i]))
         }
         tempObjects.sort(function(a, b) {
             return ((a.z < b.z) ? -1 : ((a.z == b.z) ? 0 : 1))
         })
         for (let i = 0; i < tempObjects.length; i++) {
             diameterPoints[i] = tempObjects[i].x
-            optPointLocations[i] = tempObjects[i].z
+            locationPoints[i] = tempObjects[i].z
         }
     }
+
+    // Ensure that points are organized by increasing diameter over full length
+    if (diameterPoints[0] > diameterPoints[diameterPoints.length - 1]) {
+        diameterPoints.reverse()
+        
+        let taperLength = Math.max(...locationPoints)
+        locationPoints.forEach(point => {
+            -point + taperLength
+        })
+    }
+
     // Dividing points into sections
-    var sections: Section[] = interpolatePoints(diameterPoints, optPointLocations)
+    var sections: Section[] = interpolatePoints(diameterPoints, locationPoints)
 
     // Code generation
     
@@ -588,4 +630,34 @@ function genCode(stockDiameter, diameterPoints, optPointLocations): string {
     codeText += "M30\n"
     
     return codeText
+}
+
+/** 
+ * Testing function for use within Google Apps Script editor
+ */
+function testGenCode() {
+    let stockDiameter = 0.5
+    let diameterPoints = [
+        0.335,
+        0.340,
+        0.345,
+        0.348,
+        0.350,
+        0.353,
+        0.355,
+        0.360,
+        0.366
+    ]
+    let locations = [
+        0.00,
+        0.25,
+        0.50,
+        0.75,
+        1.00,
+        1.25,
+        1.50,
+        1.75,
+        2.00
+    ]
+    genCode(stockDiameter, diameterPoints, locations)
 }
