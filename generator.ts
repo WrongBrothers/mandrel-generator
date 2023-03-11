@@ -125,6 +125,7 @@ class Section {
 
 
 // CONSTANTS
+// TODO: get colletShift measured, also check if that needs to be a function of delta diameter
 const global = {
     depths: {
         max: 0.040,
@@ -133,11 +134,13 @@ const global = {
     spacing: {
         xClearance: 0.010,
         zClearance: 0.100,
+        colletShift: 0.050
     },
     feed: 0.002,
     rpm: 1500,
     stickout: 1.000,
-    decimals: 4
+    decimals: 4,
+    G75Functional: false
 }
 
 var state: {
@@ -282,44 +285,55 @@ function boxCycle(startPoint: DimensionPoint, endPoint: DimensionPoint, finishBu
  * The cutter is returned to the start point by the G75 cycle.
  *
  * @param startPoint The initial position of the cutter, defining the oustide axes of material to be removed.
- * @param section The section whose points are to be roughed out.  Those points define the inside contour of material removal.
+ * @param points The points defining the inside contour of material removal.
  * @param subroutineID Not currently in use due to subroutine functionality being unclear.  The number to use as a label for the subroutine.
  * @return Code setting the initial position and running the G75 process.
  */
-function contourCycle(startPoint: DimensionPoint, section: Section, subroutineID: number, finishBufferRadius: number, feed: number, comment?: string): string {
-    // Set initial position
-    let code: string = linearInterpolation(startPoint.getMovePoint(), feed)
+function contourCycle(startPoint: DimensionPoint, points: DimensionPoint[], subroutineID: number, finishBufferRadius: number, feed: number, comment?: string): string {
+    let code: string = ""
 
-    // Set up 
-    code += "G75"
-    code += "I" + (+(global.depths.max / 2).toFixed(global.decimals))
-    code += "U" + (+finishBufferRadius.toFixed(global.decimals))
-    code += "F" + (+feed.toFixed(global.decimals))
-    // Subroutines currently disabled
-    // code += "P" + (+subroutineID.toFixed(global.decimals))
+    // If G75 works, do this the easy way
+    if (global.G75Functional) {
+        // Set initial position
+        code += linearInterpolation(startPoint.getMovePoint(), feed, "Beginning G75 contour cycle")
 
-    if (typeof comment !== 'undefined') {
-        code += "(" + comment + ")"
+        // Set up 
+        code += "G75"
+        code += "I" + (+(global.depths.max / 2).toFixed(global.decimals))
+        code += "U" + (+finishBufferRadius.toFixed(global.decimals))
+        code += "F" + (+feed.toFixed(global.decimals))
+        // Subroutines currently disabled
+        // code += "P" + (+subroutineID.toFixed(global.decimals))
+
+        if (typeof comment !== 'undefined') {
+            code += "(" + comment + ")"
+        }
+
+        // Close line of code
+        code += "\n"
+
+        // Reset last used function for safety
+        state.lastGCode = "None"
+
+        code += taperSubroutine(subroutineID, points)
+    }
+
+    // Otherwise, G75 is not available, use custom simulated version (comment for reference in code)
+    else {
+        code += linearInterpolation(startPoint.getMovePoint(), feed, "Simulated G75 Contour cycle" + (comment === undefined ? "" : " - " + comment))
+        code += simG75(points, global.depths.max / 2, finishBufferRadius, feed)
     }
     
-    // Close line of code
-    code += "\n"
-
-    // Reset last used function for safety
-    state.lastGCode = "None"
-
-    code += taperSubroutine(subroutineID, section)
-
     return code
 }
 
 // TODO: sections vs points continues to here
-function taperSubroutine(id: number, section: Section): string {
+function taperSubroutine(id: number, points: DimensionPoint[]): string {
     // Removing subroutine formatting (added in G3?), using RF to close
     // let code = "}" + id + "\n"
     let code: string = ""
 
-    section.machiningPoints.forEach(point => {
+    points.forEach(point => {
         code += "X" + (+point.x.toFixed(global.decimals)) + "Z" + (+point.z.toFixed(global.decimals)) + "\n"
     })
 
@@ -327,6 +341,72 @@ function taperSubroutine(id: number, section: Section): string {
     // code += "M99\n"
     
     return code
+}
+
+/**
+ * Manually simulates a G75 cycle, with some changes to improve functionality
+ *
+ * @param points The points defining the inside contour of material removal.
+ * @param I is the maximum amount to be roughed per pass, defined as the depth of cut per side
+ * @param U is the amount to be left on the part for the a finish pass
+ * @param F is the feedrate
+ * @return Code simulating a G75 cycle through G74 and manual cutter moves.
+ */
+function simG75(points: DimensionPoint[], I: number, U: number, F: number) {
+    /** Basic implementation will be:
+     *  - If there is a block of material to remove, use G74 to bring down to maximum diameter of taper (with 2U left)
+     *  - Create function to break up taper into multiple scaled passes, with max depth being I and offset by 2 * U
+     *  - Run basicTaper over each
+     */
+
+    let code: string = ""
+    let finishSpacedPoints: DimensionPoint[] = points.map(point => new DimensionPoint(point.x + 2 * U, point.z))
+    let maxDiam: number = Math.max(...finishSpacedPoints.map(point => point.x))
+    let clearZ: number = Math.min(...finishSpacedPoints.map(point => point.z))
+    let origPoint: MovePoint = new MovePoint(state.position.x, state.position.y, state.position.z)
+    // If there is material to be removed via G74 
+    if ((origPoint.x !== undefined) && (maxDiam < origPoint.x)) {
+        code += `G74X${maxDiam}Z${clearZ}I${I}U${0}F${F}\n`
+    }
+
+    // Generate tapered cutting passes
+    let passes: DimensionPoint[][] = genMultiPassPoints(points.map(point => new DimensionPoint(point.x + 2 * U, point.z)), maxDiam, I)
+    for (let pass of passes) {
+        code += basicTaper(pass.map(point => point.getMovePoint()), F)
+        code += linearInterpolation(new MovePoint(maxDiam + global.spacing.xClearance), F)
+        code += rapidPosition(new MovePoint(undefined, undefined, origPoint.z! + global.spacing.zClearance))
+    }
+
+    // Return to original position
+    code += linearInterpolation(origPoint, F)
+}
+
+/**
+ * Helper function to generate points for a set of passes with the specified maximum cut depth
+ *
+ * @param points The points defining the contour to be scaled into suitable passes.
+ * @param startX The starting plane of the passes (each point being a scaled value between this and the final cut point)
+ * @param I is the maximum amount to be roughed per pass, defined as the depth of cut per side
+ * @return A 2D array of DimensionPoints, each top-level element containing an array of DimensionPoints representing a cutting pass.
+ */
+function genMultiPassPoints(points: DimensionPoint[], startX: number, I: number): DimensionPoint[][] {
+    let xVals: number[] = points.map(point => point.x)
+    let numPasses: number = Math.ceil((startX - Math.min(...xVals)) / (2 * I))
+    let xDeltas: number[] = xVals.map(val => (startX - val) / numPasses)
+
+    var retArray: DimensionPoint[][] = []
+    // For all but last pass, calculate via this method
+    for (let i: number = 1; i < numPasses; i++) {
+        var tempArray: DimensionPoint[] = []
+        tempArray.push(...xDeltas.map((delta, index) => {
+            return new DimensionPoint(startX - i * delta, points[index].z)
+        }))
+        retArray.push(tempArray)
+    }
+    // For last pass, add original points to ensure accurate final sizing
+    retArray.push(points)
+
+    return retArray
 }
 
 /**
@@ -388,7 +468,7 @@ function sectionCycle(startDiameter: number, section: Section, subroutineID: num
     // Run G75 roughing cycle
     code += contourCycle(
         new DimensionPoint(startDiameter + global.spacing.xClearance, section.length - global.stickout + global.spacing.zClearance),
-        section,
+        section.machiningPoints,
         subroutineID,
         global.depths.max / 4,
         global.feed)
