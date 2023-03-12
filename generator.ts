@@ -182,12 +182,15 @@ function rapidPosition(point: MovePoint, comment?: string): string {
     // Insert axis data where present and new
     if (point.axesPresent.x && point.x !== state.position.x) {
         code += "X" + (+point.x!.toFixed(global.decimals))
+        state.position.x = point.x
     }
     if (point.axesPresent.y && point.y !== state.position.y) {
         code += "Y" + (+point.y!.toFixed(global.decimals))
+        state.position.y = point.y
     }
     if (point.axesPresent.z && point.z !== state.position.z) {
         code += "Z" + (+point.z!.toFixed(global.decimals))
+        state.position.z = point.z
     }
     
     // Insert comment if present
@@ -226,12 +229,15 @@ function linearInterpolation(point: MovePoint, feed?: number, comment?: string):
     // Insert axis data where present and new
     if (point.axesPresent.x && point.x !== state.position.x) {
         code += "X" + (+point.x!.toFixed(global.decimals))
+        state.position.x = point.x
     }
     if (point.axesPresent.y && point.y !== state.position.y) {
         code += "Y" + (+point.y!.toFixed(global.decimals))
+        state.position.y = point.y
     }
     if (point.axesPresent.z && point.z !== state.position.z) {
         code += "Z" + (+point.z!.toFixed(global.decimals))
+        state.position.z = point.z
     }
 
     // Insert feed rate if present and changed
@@ -261,7 +267,7 @@ function boxCycle(startPoint: DimensionPoint, endPoint: DimensionPoint, finishBu
     // Set up 
     code += "G74"
     code += "X" + (+endPoint.x.toFixed(global.decimals))
-    code += "X" + (+endPoint.z.toFixed(global.decimals))
+    code += "Z" + (+endPoint.z.toFixed(global.decimals))
     code += "I" + (+(global.depths.max / 2).toFixed(global.decimals))
     code += "U" + (+finishBufferRadius.toFixed(global.decimals))
     code += "F" + (+feed.toFixed(global.decimals))
@@ -295,7 +301,7 @@ function contourCycle(startPoint: DimensionPoint, points: DimensionPoint[], subr
     // If G75 works, do this the easy way
     if (global.G75Functional) {
         // Set initial position
-        code += linearInterpolation(startPoint.getMovePoint(), feed, "Beginning G75 contour cycle")
+        code += linearInterpolation(startPoint.getMovePoint(), feed)
 
         // Set up 
         code += "G75"
@@ -320,7 +326,8 @@ function contourCycle(startPoint: DimensionPoint, points: DimensionPoint[], subr
 
     // Otherwise, G75 is not available, use custom simulated version (comment for reference in code)
     else {
-        code += linearInterpolation(startPoint.getMovePoint(), feed, "Simulated G75 Contour cycle" + (comment === undefined ? "" : " - " + comment))
+        code += "(Simulated G75 Contour cycle" + (comment === undefined ? "" : " - " + comment) + ")\n"
+        code += linearInterpolation(startPoint.getMovePoint(), feed)
         code += simG75(points, global.depths.max / 2, finishBufferRadius, feed)
     }
     
@@ -352,7 +359,7 @@ function taperSubroutine(id: number, points: DimensionPoint[]): string {
  * @param F is the feedrate
  * @return Code simulating a G75 cycle through G74 and manual cutter moves.
  */
-function simG75(points: DimensionPoint[], I: number, U: number, F: number) {
+function simG75(points: DimensionPoint[], I: number, U: number, F: number): string {
     /** Basic implementation will be:
      *  - If there is a block of material to remove, use G74 to bring down to maximum diameter of taper (with 2U left)
      *  - Create function to break up taper into multiple scaled passes, with max depth being I and offset by 2 * U
@@ -366,19 +373,21 @@ function simG75(points: DimensionPoint[], I: number, U: number, F: number) {
     let origPoint: MovePoint = new MovePoint(state.position.x, state.position.y, state.position.z)
     // If there is material to be removed via G74 
     if ((origPoint.x !== undefined) && (maxDiam < origPoint.x)) {
-        code += `G74X${maxDiam}Z${clearZ}I${I}U${0}F${F}\n`
+        code += `G74X${+maxDiam.toFixed(global.decimals)}Z${+clearZ.toFixed(global.decimals)}I${I}U${0}F${F}\n`
+        state.lastGCode = "G74"
+        state.lastFeed = F
     }
 
     // Generate tapered cutting passes
     let passes: DimensionPoint[][] = genMultiPassPoints(points.map(point => new DimensionPoint(point.x + 2 * U, point.z)), maxDiam, I)
     for (let pass of passes) {
         code += basicTaper(pass.map(point => point.getMovePoint()), F)
-        code += linearInterpolation(new MovePoint(maxDiam + global.spacing.xClearance), F)
-        code += rapidPosition(new MovePoint(undefined, undefined, origPoint.z! + global.spacing.zClearance))
     }
 
     // Return to original position
     code += linearInterpolation(origPoint, F)
+
+    return code
 }
 
 /**
@@ -429,7 +438,8 @@ function basicTaper(points: MovePoint[], feed: number): string {
 
     // Return to clearanced version of start location
     code += linearInterpolation(new MovePoint(Math.max(...points.map(point => point.x!)) + global.spacing.xClearance))
-    code += rapidPosition(new MovePoint(undefined, undefined, startZ))
+    code += rapidPosition(new MovePoint(undefined, undefined, startZ! - global.spacing.zClearance))
+    code += linearInterpolation(new MovePoint(undefined, undefined, startZ))
     return code
 }
 
@@ -466,6 +476,7 @@ function sectionCycle(startDiameter: number, section: Section, subroutineID: num
     code += `G95F${global.feed}\n`
 
     // Run G75 roughing cycle
+    code += "(Roughing Cycle)\n"
     code += contourCycle(
         new DimensionPoint(startDiameter + global.spacing.xClearance, section.length - global.stickout + global.spacing.zClearance),
         section.machiningPoints,
@@ -474,6 +485,7 @@ function sectionCycle(startDiameter: number, section: Section, subroutineID: num
         global.feed)
 
     // Run finishing pass
+    code += "(Finishing Pass)\n"
     code += basicTaper(section.machiningPoints.map(point => point.getMovePoint()), global.feed)
 
     // Return cutter to safe position for stock movement (already moved away from contact with part)
