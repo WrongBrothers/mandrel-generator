@@ -1,32 +1,4 @@
 /*
-Necessary components:
-CORE 
-- Generate rapid positon (G00)
-- Generate linear interpolation (G01)
-- Generate box cut cycle (G74)
-- Generate contour cut cycle (G75)
-BASE OPERATIONS (combinations of core functions)
-- Generate roughing (cylindrical) pass (replaced by G74/75)
-- Generate contour/finishing pass
-LARGER OPERATIONS
-- Generation of section cycle (machining one section defined by stickout)
-- Division of provided points into sections
-- Generation of full code (using previous two concepts)
-
-Generation of code will require semi-fixed and variable data.
-Semi-fixed data:
-    - Cut depths
-    - Feed rates
-    - Safe clearances
-    - Part stickout
-Variable data:
-    - Stock diameter
-    - Diameter measurements
-    - Optional: Positions of diameter measurements
-*/
-
-
-/*
 Overview of process as understood by me:
 - Begin by arranging data into a unified array of DimensionPoint objects
 - Perform basic checks of material dimensions vs points
@@ -43,13 +15,6 @@ Overview of process as understood by me:
     - Stop spindle
 - Cleanup:
     - End of program stop
-    - ?
-*/
-
-/*
-Until further input, I will be treating the set home position as:
-    X = 0 is the axis of rotation
-    Z = 0 is the face of the workpiece when pulled out to the length denoted by "stickout"
 */
 
 class MovePoint {
@@ -125,7 +90,7 @@ class Section {
 
 
 // CONSTANTS
-// TODO: get colletShift measured, also check if that needs to be a function of delta diameter
+// Potential added feature: measure collet shift, also check if that needs to be a function of delta diameter
 const global = {
     depths: {
         max: 0.040,
@@ -140,7 +105,8 @@ const global = {
     rpm: 1500,
     stickout: 1.000,
     decimals: 4,
-    G75Functional: false
+    G75Functional: false,
+    G74Functional: false
 }
 
 var state: {
@@ -260,6 +226,7 @@ function linearInterpolation(point: MovePoint, feed?: number, comment?: string):
     return code
 }
 
+// Currently unused, as no situations need a start and end point setup, but retaining in case it becomes helpful.
 function boxCycle(startPoint: DimensionPoint, endPoint: DimensionPoint, finishBufferRadius: number, feed: number, comment?: string): string {
     // Set initial position with rapid positioning
     let code: string = rapidPosition(startPoint.getMovePoint())
@@ -308,8 +275,7 @@ function contourCycle(startPoint: DimensionPoint, points: DimensionPoint[], subr
         code += "I" + (+(global.depths.max / 2).toFixed(global.decimals))
         code += "U" + (+finishBufferRadius.toFixed(global.decimals))
         code += "F" + (+feed.toFixed(global.decimals))
-        // Subroutines currently disabled
-        // code += "P" + (+subroutineID.toFixed(global.decimals))
+        code += "P" + (+subroutineID.toFixed(global.decimals))
 
         if (typeof comment !== 'undefined') {
             code += "(" + comment + ")"
@@ -336,16 +302,13 @@ function contourCycle(startPoint: DimensionPoint, points: DimensionPoint[], subr
 
 // TODO: sections vs points continues to here
 function taperSubroutine(id: number, points: DimensionPoint[]): string {
-    // Removing subroutine formatting (added in G3?), using RF to close
-    // let code = "}" + id + "\n"
-    let code: string = ""
+    let code = "}" + id + "\n"
 
     points.forEach(point => {
         code += "X" + (+point.x.toFixed(global.decimals)) + "Z" + (+point.z.toFixed(global.decimals)) + "\n"
     })
 
-    code += "RF\n"
-    // code += "M99\n"
+    code += "M99\n"
     
     return code
 }
@@ -369,19 +332,27 @@ function simG75(points: DimensionPoint[], I: number, U: number, F: number): stri
     let code: string = ""
     let finishSpacedPoints: DimensionPoint[] = points.map(point => new DimensionPoint(point.x + 2 * U, point.z))
     let maxDiam: number = Math.max(...finishSpacedPoints.map(point => point.x))
-    let clearZ: number = Math.min(...finishSpacedPoints.map(point => point.z))
     let origPoint: MovePoint = new MovePoint(state.position.x, state.position.y, state.position.z)
-    // If there is material to be removed via G74 
-    if ((origPoint.x !== undefined) && (maxDiam < origPoint.x)) {
-        code += `G74X${+maxDiam.toFixed(global.decimals)}Z${+clearZ.toFixed(global.decimals)}I${I}U${0}F${F}\n`
-        state.lastGCode = "G74"
-        state.lastFeed = F
-    }
 
-    // Generate tapered cutting passes
-    let passes: DimensionPoint[][] = genMultiPassPoints(points.map(point => new DimensionPoint(point.x + 2 * U, point.z)), maxDiam, I)
-    for (let pass of passes) {
-        code += basicTaper(pass.map(point => point.getMovePoint()), F)
+    if (global.G74Functional) {
+        let clearZ: number = Math.min(...finishSpacedPoints.map(point => point.z))
+        // If there is material to be removed via G74 
+        if ((origPoint.x !== undefined) && (maxDiam < origPoint.x)) {
+            code += `G74X${+maxDiam.toFixed(global.decimals)}Z${+clearZ.toFixed(global.decimals)}I${I}U${0}F${F}\n`
+            state.lastGCode = "G74"
+            state.lastFeed = F
+        }
+        let passes: DimensionPoint[][] = genMultiPassPoints(points.map(point => new DimensionPoint(point.x + 2 * U, point.z)), maxDiam, I)
+        for (let pass of passes) {
+            code += basicTaper(pass.map(point => point.getMovePoint()), F)
+        }
+    }
+    else {
+        // Generate tapered cutting passes
+        let passes: DimensionPoint[][] = genMultiPassPoints(points.map(point => new DimensionPoint(point.x + 2 * U, point.z)), (origPoint.x ? origPoint.x : maxDiam), I)
+        for (let pass of passes) {
+            code += basicTaper(pass.map(point => point.getMovePoint()), F, true)
+        }
     }
 
     // Return to original position
@@ -425,11 +396,15 @@ function genMultiPassPoints(points: DimensionPoint[], startX: number, I: number)
  *
  * @param points The set of points the cutter will travel along.
  * @param feed The feed rate to be used in the linear interpolations.
+ * @param minClearance Optional parameter, if true the cutter is returned to the max diameter of the cut pass.
  * @return Code directing the cutter to follow the specified taper and return to a safe location.
  */
-function basicTaper(points: MovePoint[], feed: number): string {
+function basicTaper(points: MovePoint[], feed: number, minClearance?: boolean): string {
     let code: string = ""
     let startZ = state.position.z
+    if (minClearance == undefined) {
+        minClearance = false
+    }
 
     // Run path, beginning with movement to start point
     points.forEach(point => {
@@ -439,25 +414,29 @@ function basicTaper(points: MovePoint[], feed: number): string {
     // Return to clearanced version of start location
     code += linearInterpolation(new MovePoint(Math.max(...points.map(point => point.x!)) + global.spacing.xClearance))
     code += rapidPosition(new MovePoint(undefined, undefined, startZ! - global.spacing.zClearance))
-    code += linearInterpolation(new MovePoint(undefined, undefined, startZ))
+    if (!minClearance) {
+        code += linearInterpolation(new MovePoint(undefined, undefined, startZ))
+    }
     return code
 }
 
+/**
+ * Generates code for a single section of the provided taper, with length defined in the global data.  The cycle includes:
+ * - Setting the cutter to the zeroing location such that the stock can be moved to the new position with a hard stop for reference
+ * - Safely starting the spindle
+ * - Roughing and finishing passes of the mandrel taper
+ * - Return to safe position and spindle stop
+ *
+ * @param startDiameter The diameter of the material at the beginning of a machining section.
+ * @param section A Section object containing points to be machined.
+ * @param subroutineID A number with which to label the G75 subroutine (if it is functional)
+ * @return Code corresponding to the pull set point, spindle start, taper machining, and spindle stop cycle.
+ */
 function sectionCycle(startDiameter: number, section: Section, subroutineID: number): string {
     // Confirm that points in section will be accurately cut into material
     if (section.maxDiameter > startDiameter) {
         throw new RangeError("Provided taper includes diameter(s) exceeding provided start diameter, taper will not be accurate!")
     }
-
-    /*
-    - Set zeroing location
-    - Pause program for stock pull/insertion
-    - Back off to safe location
-    - Start spindle
-    - Roughing and finishing passes
-    - Move to safe location
-    - Stop spindle
-    */
 
     let code = ""
     // Set pull location for current section.  This will be the point in the section with the highest z value.
